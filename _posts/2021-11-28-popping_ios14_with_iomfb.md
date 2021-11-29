@@ -87,7 +87,7 @@ Okay, but what about zone garbage collection? On iOS 13 and below, abusing zone 
 
 To understand how garbage collection was changed to work with sequestering, we need to talk about how a zone manages the pages which belong to it.
 
-All zones have a chunk size. This is how many pages of *contiguous* virtual memory a zone will carve into smaller elements. This range is referred to as a "chunk". Zones with a small element size, like `*.kalloc.192`, have a chunk size of one page. But once we start pushing into zones with larger and larger element sizes, such as `*.kalloc.6144`, chunk size is upped to two pages, which is the max for devices with a 16k page size. For devices with a 4k page size, the max chunk size is eight pages. 
+All zones have a chunk size. This is how many pages of *contiguous* virtual memory a zone will carve into smaller elements. This range is referred to as a "chunk". Zones with a small element size, like `*.kalloc.192`, have a chunk size of one page. But once we start pushing into zones with larger and larger element sizes, such as `*.kalloc.6144`, chunk size is upped to 2 pages, which is the max for devices with a 16k page size. For devices with a 4k page size, the max chunk size is 8 pages. 
 
 The structure that is associated with each page in a chunk in a zone is `struct zone_page_metadata` (most comments removed for brevity):
 
@@ -116,7 +116,7 @@ struct zone_page_metadata {
 ```
 <sup>*[xnu-7195.121.3/osfmk/kern/zalloc.c](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/zalloc.c#L159)*</sup>
 
-If a zone page metadata structure is associated with the first page in a chunk, `zm_chunk_len` is the chunk size of the zone that `zm_index`, an index into XNU's `zone_array`, refers to. If the chunk size is more than one page, then for the second page and onward, `zm_chunk_len` is defined as either `ZM_SECONDARY_PAGE` or `ZM_SECONDARY_PAGE_PCPU_PAGE`, and `zm_page_index` acts as an index into the chunk. Otherwise, `zm_alloc_size` tells us how many bytes in that chunk are currently allocated. `zm_page_next` and `zm_page_prev` work together to form a queue of chunks for `zm_index`'s zone. If a zone page metadata structure is the head for this queue of chunks, `zm_page_prev` holds a value encoded by [`zone_queue_encode`](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/zalloc.c#L893). If it's not the head, both point to the first page of the previous/next chunk, but only when the zone page metadata structure they belong to is associated with the first page in a chunk. For the second page of a chunk and onward, they're both zero. Ignore the strange `zone_pva_t` type for now—there will be more on that later.
+If a zone page metadata structure is associated with the first page in a chunk, `zm_chunk_len` is the chunk size of the zone that `zm_index`, an index into XNU's `zone_array`, refers to. If the chunk size is more than one page, then for the second page and onward, `zm_chunk_len` is defined as either `ZM_SECONDARY_PAGE` or `ZM_SECONDARY_PAGE_PCPU_PAGE`, and `zm_page_index` acts as an index into the chunk. Otherwise, `zm_alloc_size` tells us how many bytes in that chunk are currently allocated. `zm_page_next` and `zm_page_prev` work together to form a queue of chunks for `zm_index`'s zone. If a zone page metadata structure is the head for this queue of chunks, `zm_page_prev` holds a value encoded by [`zone_queue_encode`](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/zalloc.c#L893). If it's not the head, both point to the first page of the previous/next chunk, but only when the zone page metadata structure they belong to is associated with the first page in a chunk. Ignore the strange `zone_pva_t` type for now—there will be more on that later.
 
 All zone structures carry pointers to zone page metadata structures, each of which serve a different purpose. On iOS 13 and below, those pointers were called `all_free`, `intermediate`, and `all_used`. `all_free` maintains a queue of chunks with only free elements, `intermediate` maintains a queue of chunks with both free and used elements, and `all_used` maintains a queue of chunks with only used elements. On iOS 14 and up, they were renamed to `empty`, `partial`, and `full` respectively, but their purposes stayed the same.
 
@@ -240,30 +240,43 @@ Alright, so how is XNU using `z_pageq_va`? The answer is in [`zone_expand_locked
 if (!zone_pva_is_null(z->z_pageq_va)) {
     meta = zone_meta_queue_pop_native(z,
         &z->z_pageq_va, &addr);
+
+    if (meta->zm_chunk_len == ZM_SECONDARY_PAGE) {
+        cur_pages = meta->zm_page_index;
+        meta -= cur_pages;
+        addr -= ptoa(cur_pages);
+        zone_meta_lock_in_partial(z, meta, cur_pages);
+    }
 }
 ```
 <sup>*[xnu-7195.121.3/osfmk/kern/zalloc.c](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/zalloc.c#L4599)*</sup>
 
-Next, enough free pages to satisfy the size of the chunk are allocated with [`vm_page_grab`](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/vm/vm_resident.c#L3085):
+Wait, why is this code checking if `addr` is not the first page in the chunk? I didn't mention this earlier because I had not yet explained the purpose of `z_pageq_va`, but a chunk can actually be comprised of populated *and* depopulated virtual memory. This is a big deal because it can be difficult to allocate enough pages for an entire chunk when the system is stressed for free memory. Partially-populated chunks benefit 4K devices more than 16K devices, since again, the maximum chunk size for 4K is 8 pages, as opposed to 2 pages for 16K. The first page of a partially-populated chunk will always be populated. Whether or not the following pages are populated of course depends on how much free memory there is.
+
+If we shift focus back to `zone_expand_locked`, we see that XNU tries to grab enough free pages with [`vm_page_grab`](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/vm/vm_resident.c#L3085) to satisfy `min_pages`, *not* the chunk size for the zone `z`. `min_pages` is the element size for `z` rounded up to the nearest page. This is what could end up producing a partially-populated chunk later, since nothing here enforces that a free page is to be allocated for every page in the chunk `addr` belongs to:
 
 ```
 while (pages < z->z_chunk_pages - cur_pages) {
-        vm_page_t m = vm_page_grab();
+    vm_page_t m = vm_page_grab();
 
-        if (m) {
-            pages++;
-            m->vmp_snext = page_list;
-            page_list = m;
-            vm_page_zero_fill(m);
-            continue;
-        }
+    if (m) {
+        pages++;
+        m->vmp_snext = page_list;
+        page_list = m;
+        vm_page_zero_fill(m);
+        continue;
+    }
 
-        /* ... */
+    if (pages >= min_pages && (vm_pool_low() || waited)) {
+        break;
+    }
+
+    /* ... */
 }
 ```
 <sup>*[xnu-7195.121.3/osfmk/kern/zalloc.c](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/zalloc.c#L4635)*</sup>
 
-After all needed free pages are allocated, [`kernel_memory_populate_with_pages`](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/vm/vm_kern.c#L564) remaps the depopulated virtual memory from the recently-popped `z_pageq_va` chunk onto the physical memory backing those free pages:
+Next, [`kernel_memory_populate_with_pages`](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/vm/vm_kern.c#L564) is called to remap the depopulated virtual memory from the recently-popped `z_pageq_va` chunk onto the physical memory backing the free pages which were just allocated. However, if XNU couldn't allocate enough free pages to satisfy the length of that chunk, some pages in that chunk will remain depopulated after `kernel_memory_populate_with_pages` returns. Again, this is what produces a partially-populated chunk. 
 
 ```
 kernel_memory_populate_with_pages(zone_submap(z),
@@ -272,13 +285,19 @@ kernel_memory_populate_with_pages(zone_submap(z),
 ```
 <sup>*[xnu-7195.121.3/osfmk/kern/zalloc.c](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/zalloc.c#L4687)*</sup>
 
-Finally, [`zcram_and_lock`](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/zalloc.c#L4281) is called. This function is responsible for making the remapped chunk once again usable for the zone referenced by its first parameter.
+Finally, [`zcram_and_lock`](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/zalloc.c#L4281) is called. This function is responsible for making the remapped chunk once again usable for a zone. If this chunk ended up being partially-populated, it makes sure the depopulated pages make it back to `z_pageq_va`:
 
 ```
-zcram_and_lock(z, addr, new_va, cur_pages, cur_pages + pages,
-    ZONE_ADDR_NATIVE);
+/* ... */
+
+if (pg_end < chunk_pages) {
+    /* push any non populated residual VA on z_pageq_va */
+    zone_meta_queue_push(zone, &zone->z_pageq_va, meta + pg_end);
+}
+
+/* ... */
 ```
-<sup>*[xnu-7195.121.3/osfmk/kern/zalloc.c](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/zalloc.c#L4693)*</sup>
+<sup>*[xnu-7195.121.3/osfmk/kern/zalloc.c](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/zalloc.c#L4373)*</sup>
 
 To sum everything up, the new zone garbage collection/zone expansion flow provides a really strong guarantee: because the virtual memory for sequestered pages is not actually freed to the zone map, it is impossible to re-use that virtual memory for another zone. And if kheaps uphold their promises of separation, spraying is looking less and less viable.
 

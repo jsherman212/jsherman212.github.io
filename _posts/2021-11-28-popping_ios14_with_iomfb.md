@@ -276,7 +276,7 @@ while (pages < z->z_chunk_pages - cur_pages) {
 ```
 <sup>*[xnu-7195.121.3/osfmk/kern/zalloc.c](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/zalloc.c#L4635)*</sup>
 
-Next, [`kernel_memory_populate_with_pages`](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/vm/vm_kern.c#L564) is called to remap the depopulated virtual memory from the recently-popped `z_pageq_va` chunk onto the physical memory backing the free pages which were just allocated. However, if XNU couldn't allocate enough free pages to satisfy the length of that chunk, some pages in that chunk will remain depopulated after `kernel_memory_populate_with_pages` returns. Again, this is what produces a partially-populated chunk. 
+Next, [`kernel_memory_populate_with_pages`](https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/vm/vm_kern.c#L564) is called to remap the depopulated virtual memory from the recently-popped `z_pageq_va` chunk onto the physical memory backing the free pages which were just allocated. However, if XNU couldn't allocate enough free pages to satisfy the length of that chunk, some pages in that chunk will remain depopulated after `kernel_memory_populate_with_pages` returns, producing a partially-populated chunk. 
 
 ```
 kernel_memory_populate_with_pages(zone_submap(z),

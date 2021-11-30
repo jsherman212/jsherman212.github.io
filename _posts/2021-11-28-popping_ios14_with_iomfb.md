@@ -314,7 +314,7 @@ There is another problem when exploiting this vulnerability: we can interpret a 
 
 With zone garbage collection nerfed into the ground and no way to shape `kext.kalloc.6144`, spraying is not looking good. We'd literally be making a blind guess about the distance from a `kext.kalloc.6144` page to a sprayed object, and that would have an abysmal success rate.
 
-## The Light In the Middle of the Pipeline
+## The Light in the Middle of the Pipeline
 
 Hold on, `0x13a0` bytes for a kernel object? That is excessively large, and opens the door to a *lot* of potential pointer fields. And again, since the array is defined inline, accesses to it look like `*(UnifiedPipeline + 0xa98 + (0x8 * idx))` and not `*(*(UnifiedPipeline + 0xa98) + (0x8 * idx))` In case you missed it, `0xa98` is the offset of the `IOSurface` array we can read out-of-bounds from (at least on my phones). Thus, we're able to read off any pointer field from the `UnifiedPipeline` object and type confuse with it. This has got to lead somewhere, so I dumped the fields which resembled a kernel pointer and derived the objects those pointers represented. The format is the following: `<offset>: <object class> (<size>)`.
 
